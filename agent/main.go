@@ -80,13 +80,17 @@ func collectAndSendMetrics(apiURL, apiToken string, cli *client.Client) {
 				if len(c.Names) > 0 {
 					name = strings.TrimPrefix(c.Names[0], "/")
 				}
-				
+
+				// TODO(agent): per-container CPU/RAM % requires sampling
+				// `cli.ContainerStats` twice (needs two readings to compute
+				// CPU delta) and extracting MemoryStats.Usage / Limit.
+				// Tracked as roadmap item in ai_context_readme.md.
 				containers = append(containers, ContainerMetric{
 					ContainerID: c.ID[:12],
 					Name:        name,
 					State:       c.State,
-					CPUPercent:  0.0, // Для спрощення MVP залишаємо 0.0, глибокий парсинг Docker Stats можна додати пізніше
-					RAMPercent:  0.0,
+					CPUPercent:  0.0, // stub — see TODO above
+					RAMPercent:  0.0, // stub — see TODO above
 				})
 			}
 		}

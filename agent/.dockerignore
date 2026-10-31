@@ -1,0 +1,7 @@
+.git
+.gitignore
+Dockerfile
+.dockerignore
+*.md
+# Pre-built binary (if a developer compiled locally)
+monitoring-agent

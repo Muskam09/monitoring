@@ -123,12 +123,31 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
+!.env.example
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Node / Vite
+node_modules/
+dist/
+.vite/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# CyberStrike / local notes
+.cyberstrike/
 
 # Spyder project settings
 .spyderproject
@@ -153,3 +172,6 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# secret
+internal/*

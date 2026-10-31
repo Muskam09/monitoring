@@ -2,50 +2,83 @@ services:
   db:
     image: postgres:17-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: devops_dashboard
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    # Bind to loopback only — Postgres is reachable from the backend container
+    # over the internal docker network, no need to expose it on 0.0.0.0.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d devops_dashboard"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   backend:
     build: ./backend
     ports:
       - "8000:8000"
+    env_file:
+      - .env
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/devops_dashboard
+      # DATABASE_URL / JWT_SECRET_KEY / CORS_ALLOWED_ORIGINS / GOOGLE_CLIENT_ID
+      # all come from .env above. Nothing hardcoded here.
+      - PYTHONUNBUFFERED=1
     depends_on:
       db:
         condition: service_healthy
+      mailhog:
+        condition: service_started
     volumes:
       - ./backend:/app
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8000/health\", timeout=2).status==200 else 1)'"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    # Dev-friendly: hot-reload uvicorn when files under /app change
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
 
   agent:
     build: ./agent
     environment:
       - API_URL=http://backend:8000/api/telemetry
-      - API_TOKEN=test-secret-token-123  # Цей токен ми створимо в БД на наступному кроці
+      - API_TOKEN=${AGENT_API_TOKEN}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    ports:
+      - "127.0.0.1:1025:1025"   # SMTP (loopback only)
+      - "127.0.0.1:8025:8025"   # Web UI
+    restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      target: dev
     ports:
       - "5173:5173"
+    env_file:
+      - .env
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
     volumes:
       - ./frontend:/app
       - /app/node_modules
+    restart: unless-stopped
 
 volumes:
   pgdata:
