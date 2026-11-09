@@ -86,11 +86,19 @@ def receive_telemetry(
     host: models.Host = Depends(verify_agent_token),
     db: Session = Depends(get_db),
 ):
+    # New metric row with the FULL set of host-level stats the agent now sends.
     db_metric = models.HostMetric(
         host_id=host.id,
         cpu_percent=payload.cpu_percent,
         ram_percent=payload.ram_percent,
         disk_percent=payload.disk_percent,
+        inode_percent=payload.inode_percent,
+        disk_read_bytes_per_sec=payload.disk_read_bytes_per_sec,
+        disk_write_bytes_per_sec=payload.disk_write_bytes_per_sec,
+        net_external_rx_bps=payload.net_external_rx_bps,
+        net_external_tx_bps=payload.net_external_tx_bps,
+        net_internal_rx_bps=payload.net_internal_rx_bps,
+        net_internal_tx_bps=payload.net_internal_tx_bps,
     )
     db.add(db_metric)
     db.commit()
@@ -109,63 +117,502 @@ def receive_telemetry(
         )
 
     host.is_online = True  # type: ignore[assignment]
+    host.last_seen_at = _now()
+    # One-time: fill OS / uptime on first heartbeat if not already set.
+    if payload.os_info and not host.os_info:
+        host.os_info = payload.os_info
+    if payload.uptime_seconds is not None:
+        host.uptime_seconds = payload.uptime_seconds
     db.commit()
     return {"status": "success", "metric_id": db_metric.id}
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  DASHBOARD (JWT-protected)
+#  DASHBOARD (JWT-protected) + RBAC
 # ═══════════════════════════════════════════════════════════════════════
-@app.get("/api/hosts", tags=["dashboard"])
+# A host is considered offline if its last heartbeat is older than 60 s.
+HOST_OFFLINE_AFTER_SECONDS = 60
+
+
+def _mark_stale_offline(db: Session) -> None:
+    cutoff = _now() - timedelta(seconds=HOST_OFFLINE_AFTER_SECONDS)
+    (
+        db.query(models.Host)
+        .filter(models.Host.last_seen_at != None)  # noqa: E711
+        .filter(models.Host.last_seen_at < cutoff)
+        .filter(models.Host.is_online.is_(True))
+        .update({models.Host.is_online: False}, synchronize_session=False)
+    )
+    db.commit()
+
+
+# ─── RBAC helpers ──────────────────────────────────────────────────────
+def _visible_host_ids(db: Session, user: models.User) -> set[int]:
+    """Return the set of host IDs the user is allowed to see.
+
+    Rules:
+      - Super-admin (User.is_admin=True) sees EVERYTHING.
+      - A regular user sees (hosts they own) ∪ (hosts granted via HostAccess).
+    """
+    if user.is_admin:
+        return {h[0] for h in db.query(models.Host.id).all()}
+    owned = {h[0] for h in db.query(models.Host.id).filter(models.Host.owner_id == user.id).all()}
+    shared = {
+        h[0] for h in db.query(models.HostAccess.host_id)
+        .filter(models.HostAccess.user_id == user.id).all()
+    }
+    return owned | shared
+
+
+def _can_view_host(db: Session, user: models.User, host: models.Host) -> bool:
+    if user.is_admin:
+        return True
+    if host.owner_id == user.id:
+        return True
+    return (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host.id)
+        .filter(models.HostAccess.user_id == user.id)
+        .first()
+        is not None
+    )
+
+
+def _can_manage_host(user: models.User, host: models.Host) -> bool:
+    """Who can share/revoke access and delete the host: owner or super-admin."""
+    return user.is_admin or host.owner_id == user.id
+
+
+def _require_host_view(
+    host_id: int, db: Session, user: models.User
+) -> models.Host:
+    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    if not host:
+        raise HTTPException(status_code=404, detail="Хост не знайдено")
+    if not _can_view_host(db, user, host):
+        # Reveal nothing — same 404 the UI would see for a non-existent host.
+        raise HTTPException(status_code=404, detail="Хост не знайдено")
+    return host
+
+
+def _require_host_manage(
+    host_id: int, db: Session, user: models.User
+) -> models.Host:
+    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    if not host:
+        raise HTTPException(status_code=404, detail="Хост не знайдено")
+    if not _can_manage_host(user, host):
+        raise HTTPException(
+            status_code=403,
+            detail="Лише власник цього хоста або супер-адмін може керувати доступом",
+        )
+    return host
+
+
+def _access_role_label(user: models.User, host: models.Host) -> str:
+    if user.is_admin:
+        return "admin"
+    if host.owner_id == user.id:
+        return "owner"
+    return "shared"
+
+
+# ─── Hosts list ─────────────────────────────────────────────────────────
+@app.get("/api/hosts", response_model=list[schemas.HostDetail], tags=["dashboard"])
 def get_hosts(
     db: Session = Depends(get_db),
-    _user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.get_current_user),
 ):
-    return db.query(models.Host).all()
+    _mark_stale_offline(db)
+    visible = _visible_host_ids(db, user)
+    if not visible:
+        return []
+    hosts = (
+        db.query(models.Host)
+        .filter(models.Host.id.in_(visible))
+        .order_by(models.Host.id.asc())
+        .all()
+    )
+    out = []
+    for h in hosts:
+        last = (
+            db.query(models.HostMetric)
+            .filter(models.HostMetric.host_id == h.id)
+            .order_by(models.HostMetric.timestamp.desc())
+            .first()
+        )
+        owner_name = h.owner.username if h.owner else None
+        out.append({
+            "id": h.id,
+            "name": h.name,
+            "ip_address": h.ip_address,
+            "port": h.port,
+            "is_online": h.is_online,
+            "os_info": h.os_info,
+            "uptime_seconds": h.uptime_seconds,
+            "last_seen_at": h.last_seen_at,
+            "created_at": h.created_at,
+            "cpu_percent": last.cpu_percent if last else None,
+            "ram_percent": last.ram_percent if last else None,
+            "disk_percent": last.disk_percent if last else None,
+            "inode_percent": last.inode_percent if last else None,
+            "owner_id": h.owner_id,
+            "owner_username": owner_name,
+            "my_access": _access_role_label(user, h),
+        })
+    return out
 
 
 @app.get("/api/hosts/{host_id}/metrics", tags=["dashboard"])
 def get_host_metrics(
     host_id: int,
+    limit: int = 60,
     db: Session = Depends(get_db),
-    _user: models.User = Depends(auth.get_current_user),
+    user: models.User = Depends(auth.get_current_user),
 ):
+    _require_host_view(host_id, db, user)
     rows = (
         db.query(models.HostMetric)
         .filter(models.HostMetric.host_id == host_id)
         .order_by(models.HostMetric.timestamp.desc())
-        .limit(20)
+        .limit(min(limit, 240))
         .all()
     )
     return list(reversed(rows))
 
 
-class HostRegister(BaseModel):
-    name: str
-    ip_address: str | None = None
-
-
-@app.post("/api/hosts", tags=["dashboard"])
-def register_host(
-    body: HostRegister,
+@app.get("/api/hosts/{host_id}/containers", tags=["dashboard"])
+def get_latest_containers(
+    host_id: int,
     db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
 ):
-    if user.role != models.RoleEnum.editor and not user.is_admin:
-        raise HTTPException(status_code=403, detail="Editor role required")
+    _require_host_view(host_id, db, user)
+    newest = (
+        db.query(models.HostMetric)
+        .filter(models.HostMetric.host_id == host_id)
+        .order_by(models.HostMetric.timestamp.desc())
+        .first()
+    )
+    if not newest:
+        return []
+    rows = (
+        db.query(models.ContainerMetric)
+        .filter(models.ContainerMetric.host_metric_id == newest.id)
+        .order_by(models.ContainerMetric.name.asc())
+        .all()
+    )
+    return [
+        {
+            "container_id": r.container_id,
+            "name": r.name,
+            "state": r.state,
+            "cpu_percent": r.cpu_percent,
+            "ram_percent": r.ram_percent,
+        }
+        for r in rows
+    ]
+
+
+# ─── "Add System" — Beszel-style registration ──────────────────────────
+def _generate_fake_ssh_key() -> str:
+    blob = secrets.token_bytes(32)
+    import base64 as _b64
+    return "ssh-ed25519 " + _b64.b64encode(blob).decode("ascii")
+
+
+def _render_compose(host: models.Host, hub_url: str) -> str:
+    return (
+        "services:\n"
+        "  monitoring-agent:\n"
+        "    image: your-registry/monitoring-agent:latest\n"
+        f"    container_name: monitoring-agent-{host.name}\n"
+        "    restart: unless-stopped\n"
+        "    volumes:\n"
+        "      - /var/run/docker.sock:/var/run/docker.sock:ro\n"
+        "    environment:\n"
+        f"      API_URL: {hub_url}/api/telemetry\n"
+        f"      API_TOKEN: {host.api_token}\n"
+        f"      LISTEN: {host.port or 45876}\n"
+    )
+
+
+@app.post(
+    "/api/hosts",
+    response_model=schemas.HostCreateResponse,
+    tags=["dashboard"],
+)
+def register_host(
+    body: schemas.HostCreateRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    # ANY logged-in user may create a host. The creator becomes its owner
+    # ("admin of that server") — per the new RBAC spec.
     if db.query(models.Host).filter(models.Host.name == body.name).first():
-        raise HTTPException(status_code=400, detail="Host name already exists")
+        raise HTTPException(status_code=400, detail="Хост з такою назвою вже існує")
+
     token = secrets.token_urlsafe(32)
+    pub_key = _generate_fake_ssh_key()
     host = models.Host(
         name=body.name,
         ip_address=body.ip_address,
+        port=body.port or 45876,
         api_token=token,
+        public_key=pub_key,
         is_online=False,
+        owner_id=user.id,
     )
     db.add(host)
     db.commit()
     db.refresh(host)
-    return {"id": host.id, "name": host.name, "api_token": token}
+
+    hub_url = os.getenv("PUBLIC_HUB_URL") or str(request.base_url).rstrip("/")
+
+    return schemas.HostCreateResponse(
+        id=host.id,
+        name=host.name,
+        ip_address=host.ip_address,
+        port=host.port or 45876,
+        api_token=token,
+        public_key=pub_key,
+        hub_url=hub_url,
+        docker_compose=_render_compose(host, hub_url),
+    )
+
+
+@app.delete("/api/hosts/{host_id}", tags=["dashboard"])
+def delete_host(
+    host_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    host = _require_host_manage(host_id, db, user)
+    db.delete(host)
+    db.commit()
+    return {"message": "deleted"}
+
+
+# ─── Host access sharing (RBAC) ────────────────────────────────────────
+def _resolve_user_by_identifier(db: Session, identifier: str) -> models.User | None:
+    """Accept either email or username. Case-insensitive on email."""
+    ident = identifier.strip()
+    if not ident:
+        return None
+    # Try username first (usernames are case-sensitive per our model)
+    u = db.query(models.User).filter(models.User.username == ident).first()
+    if u:
+        return u
+    # Then try email (lowercased)
+    return (
+        db.query(models.User)
+        .filter(models.User.email.ilike(ident))
+        .first()
+    )
+
+
+@app.get(
+    "/api/hosts/{host_id}/access",
+    response_model=schemas.HostAccessBoard,
+    tags=["dashboard"],
+)
+def host_access_board(
+    host_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    """Who can see this host. Readable by anyone with view access;
+    only owner / super-admin get `can_manage=True`."""
+    host = _require_host_view(host_id, db, user)
+    grants = (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host_id)
+        .all()
+    )
+    entries = []
+    for g in grants:
+        entries.append(schemas.HostAccessEntry(
+            user_id=g.user.id,
+            username=g.user.username,
+            email=g.user.email,
+            granted_by_id=g.granted_by_id,
+            granted_by_username=g.granted_by.username if g.granted_by else None,
+            granted_at=g.granted_at,
+        ))
+    return schemas.HostAccessBoard(
+        host_id=host.id,
+        owner_id=host.owner_id,
+        owner_username=host.owner.username if host.owner else None,
+        grants=entries,
+        can_manage=_can_manage_host(user, host),
+    )
+
+
+@app.post(
+    "/api/hosts/{host_id}/share",
+    response_model=schemas.HostAccessEntry,
+    tags=["dashboard"],
+)
+def share_host_access(
+    host_id: int,
+    body: schemas.ShareHostRequest,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    host = _require_host_manage(host_id, db, user)
+    target = _resolve_user_by_identifier(db, body.identifier)
+    if not target:
+        # EXACT message the spec asks for: existing-user check.
+        raise HTTPException(
+            status_code=404,
+            detail="Користувача з такою поштою або логіном не знайдено в системі",
+        )
+    if target.id == host.owner_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Власник уже має повний доступ до цього хоста",
+        )
+    if target.is_admin:
+        raise HTTPException(
+            status_code=400,
+            detail="Супер-адмін уже має доступ до всіх хостів",
+        )
+
+    existing = (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host.id)
+        .filter(models.HostAccess.user_id == target.id)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Доступ уже надано")
+
+    grant = models.HostAccess(
+        host_id=host.id,
+        user_id=target.id,
+        granted_by_id=user.id,
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+
+    return schemas.HostAccessEntry(
+        user_id=target.id,
+        username=target.username,
+        email=target.email,
+        granted_by_id=user.id,
+        granted_by_username=user.username,
+        granted_at=grant.granted_at,
+    )
+
+
+@app.delete(
+    "/api/hosts/{host_id}/share/{user_id}",
+    tags=["dashboard"],
+)
+def revoke_host_access(
+    host_id: int,
+    user_id: int,
+    db: Session = Depends(get_db),
+    user: models.User = Depends(auth.get_current_user),
+):
+    _require_host_manage(host_id, db, user)
+    grant = (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host_id)
+        .filter(models.HostAccess.user_id == user_id)
+        .first()
+    )
+    if not grant:
+        raise HTTPException(status_code=404, detail="Запис доступу не знайдено")
+    db.delete(grant)
+    db.commit()
+    return {"message": "revoked"}
+
+
+# ─── Super-admin: access matrix across all users × all hosts ───────────
+@app.get(
+    "/api/admin/access-matrix",
+    response_model=list[schemas.AdminUserAccessRow],
+    tags=["admin"],
+)
+def admin_access_matrix(
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.get_current_admin),
+):
+    users = db.query(models.User).order_by(models.User.id.asc()).all()
+    rows = []
+    for u in users:
+        owned = [
+            h[0] for h in db.query(models.Host.id)
+            .filter(models.Host.owner_id == u.id).all()
+        ]
+        shared = [
+            h[0] for h in db.query(models.HostAccess.host_id)
+            .filter(models.HostAccess.user_id == u.id).all()
+        ]
+        rows.append(schemas.AdminUserAccessRow(
+            user_id=u.id,
+            username=u.username,
+            email=u.email,
+            is_admin=u.is_admin,
+            owned_host_ids=owned,
+            shared_host_ids=shared,
+        ))
+    return rows
+
+
+@app.post(
+    "/api/admin/users/{user_id}/grant/{host_id}",
+    tags=["admin"],
+)
+def admin_grant_access(
+    user_id: int,
+    host_id: int,
+    db: Session = Depends(get_db),
+    admin: models.User = Depends(auth.get_current_admin),
+):
+    target = db.query(models.User).filter(models.User.id == user_id).first()
+    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    if not target or not host:
+        raise HTTPException(status_code=404, detail="User or host not found")
+    if host.owner_id == user_id or target.is_admin:
+        return {"message": "already-has-access"}
+    exists = (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host_id)
+        .filter(models.HostAccess.user_id == user_id)
+        .first()
+    )
+    if exists:
+        return {"message": "already-granted"}
+    db.add(models.HostAccess(host_id=host_id, user_id=user_id, granted_by_id=admin.id))
+    db.commit()
+    return {"message": "granted"}
+
+
+@app.delete(
+    "/api/admin/users/{user_id}/revoke/{host_id}",
+    tags=["admin"],
+)
+def admin_revoke_access(
+    user_id: int,
+    host_id: int,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.get_current_admin),
+):
+    grant = (
+        db.query(models.HostAccess)
+        .filter(models.HostAccess.host_id == host_id)
+        .filter(models.HostAccess.user_id == user_id)
+        .first()
+    )
+    if not grant:
+        raise HTTPException(status_code=404, detail="Grant not found")
+    db.delete(grant)
+    db.commit()
+    return {"message": "revoked"}
 
 
 # ═══════════════════════════════════════════════════════════════════════

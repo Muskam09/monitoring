@@ -20,7 +20,102 @@ class HostMetricCreate(BaseModel):
     cpu_percent: float
     ram_percent: float
     disk_percent: float
+    # New rich telemetry (optional for backwards compat with the old agent)
+    inode_percent: float = 0.0
+    disk_read_bytes_per_sec: float = 0.0
+    disk_write_bytes_per_sec: float = 0.0
+    net_external_rx_bps: float = 0.0
+    net_external_tx_bps: float = 0.0
+    net_internal_rx_bps: float = 0.0
+    net_internal_tx_bps: float = 0.0
+    # One-time host info (only used if currently NULL on the host row)
+    os_info: Optional[str] = None
+    uptime_seconds: Optional[int] = None
     containers: List[ContainerMetricCreate] = []
+
+
+# ─── "Add System" modal (Beszel-style) ─────────────────────────────────
+class HostCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+    ip_address: Optional[str] = None
+    port: Optional[int] = Field(default=45876, ge=1, le=65535)
+
+
+class HostCreateResponse(BaseModel):
+    id: int
+    name: str
+    ip_address: Optional[str] = None
+    port: int
+    api_token: str
+    public_key: str
+    hub_url: str
+    docker_compose: str  # ready-to-paste YAML
+
+
+class HostDetail(BaseModel):
+    id: int
+    name: str
+    ip_address: Optional[str] = None
+    port: Optional[int] = None
+    is_online: bool
+    os_info: Optional[str] = None
+    uptime_seconds: Optional[int] = None
+    last_seen_at: Optional[datetime] = None
+    created_at: datetime
+
+    # Last-known values, pulled from the newest metric row if any.
+    cpu_percent: Optional[float] = None
+    ram_percent: Optional[float] = None
+    disk_percent: Optional[float] = None
+    inode_percent: Optional[float] = None
+
+    # RBAC — who owns this host, and the caller's role for it.
+    owner_id: Optional[int] = None
+    owner_username: Optional[str] = None
+    # One of: "owner", "shared", "admin"
+    my_access: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─── RBAC — host access sharing ────────────────────────────────────────
+class ShareHostRequest(BaseModel):
+    # The admin / host-owner enters either an email OR a username to
+    # identify an existing registered user.
+    identifier: str = Field(min_length=1, max_length=255)
+
+
+class HostAccessEntry(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    granted_by_id: Optional[int] = None
+    granted_by_username: Optional[str] = None
+    granted_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class HostAccessBoard(BaseModel):
+    """Everything the UI needs to show a host's access panel in one call."""
+    host_id: int
+    owner_id: Optional[int] = None
+    owner_username: Optional[str] = None
+    grants: List[HostAccessEntry] = []
+    can_manage: bool = False
+
+
+# ─── Admin matrix: user × host ─────────────────────────────────────────
+class AdminUserAccessRow(BaseModel):
+    user_id: int
+    username: str
+    email: str
+    is_admin: bool
+    # IDs of hosts this user owns + hosts they've been granted
+    owned_host_ids: List[int] = []
+    shared_host_ids: List[int] = []
 
 
 # ─── User registration / login ─────────────────────────────────────────

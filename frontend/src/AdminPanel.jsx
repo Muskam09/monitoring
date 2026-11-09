@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import api from './api';
+import AccessMatrix from './AccessMatrix';
 
 export default function AdminPanel() {
   const [users, setUsers] = useState([]);
@@ -48,6 +49,12 @@ export default function AdminPanel() {
             className={`px-3 py-1 rounded ${tab === 'logs' ? 'bg-blue-100' : ''}`}
           >
             Журнал входів ({logs.length})
+          </button>
+          <button
+            onClick={() => setTab('access')}
+            className={`px-3 py-1 rounded ${tab === 'access' ? 'bg-blue-100' : ''}`}
+          >
+            Доступи
           </button>
           <button onClick={refresh} className="px-3 py-1 text-gray-500 hover:text-black">
             ⟳
@@ -145,6 +152,8 @@ export default function AdminPanel() {
           </table>
         </div>
       )}
+
+      {tab === 'access' && <AccessMatrix />}
     </div>
   );
 }

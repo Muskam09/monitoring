@@ -1,9 +1,10 @@
 import { useMemo, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import api from './api';
 import { evaluate } from './passwordStrength';
 
 export default function ResetPasswordPage() {
+  const navigate = useNavigate();
   const { token } = useParams();
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -40,6 +41,8 @@ export default function ResetPasswordPage() {
     }
   };
 
+  const goHome = () => navigate('/', { replace: true });
+
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100">
       <div className="bg-white p-8 rounded-lg shadow-md w-96">
@@ -56,6 +59,7 @@ export default function ResetPasswordPage() {
               className="w-full border px-3 py-2 rounded"
               autoComplete="new-password"
               required
+              autoFocus
             />
             <input
               type="password"
@@ -99,10 +103,15 @@ export default function ResetPasswordPage() {
         {msg && !ok && (
           <div className="text-red-600 text-sm mt-3 text-center">{msg}</div>
         )}
+
         <div className="text-center mt-6">
-          <Link to="/" className="text-blue-600 hover:underline text-sm">
-            На головну
-          </Link>
+          <button
+            type="button"
+            onClick={goHome}
+            className="text-blue-600 hover:underline text-sm bg-transparent border-none cursor-pointer"
+          >
+            ← Повернутися до входу
+          </button>
         </div>
       </div>
     </div>
