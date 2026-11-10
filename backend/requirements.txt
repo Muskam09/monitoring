@@ -12,3 +12,9 @@ alembic==1.14.0
 # Task 5 — TOTP 2FA
 pyotp==2.9.0
 qrcode[pil]==7.4.2
+# ─── Testing ───────────────────────────────────────────────────────────
+# pytest runs the Unit + Integration test suites in backend/tests/.
+# httpx (pinned above) is reused by the integration tests for async /
+# TestClient-style FastAPI endpoint testing. sqlalchemy (pinned above)
+# backs the in-memory SQLite test database wired up in conftest.py.
+pytest==8.3.4
