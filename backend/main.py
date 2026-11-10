@@ -19,6 +19,8 @@ import models
 import schemas
 import totp
 from database import engine, get_db
+from repositories import HostRepository, MetricRepository, UserRepository
+from strategies import MetricEvaluationStrategy, get_strategy
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -26,6 +28,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
+# Alembic owns the schema in production (see entrypoint.sh). This call is
+# kept as a safety net for local scripts that import `main` directly
+# without the Docker entrypoint (and for the test suite, which uses an
+# in-memory SQLite engine and never hits Alembic).
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Custom DevOps Dashboard API")
@@ -52,9 +58,37 @@ ACTIVATION_TOKEN_TTL_HOURS = int(os.getenv("ACTIVATION_TOKEN_TTL_HOURS", "24"))
 PASSWORD_RESET_TTL_MINUTES = int(os.getenv("PASSWORD_RESET_TTL_MINUTES", "60"))
 TWOFA_TICKET_TTL_MINUTES = 5
 
+# A host is considered offline if its last heartbeat is older than 60 s.
+HOST_OFFLINE_AFTER_SECONDS = 60
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  DEPENDENCY INJECTION — Repositories + Strategy (Lab #12)
+# ═══════════════════════════════════════════════════════════════════════
+# Routes receive repositories via FastAPI's `Depends`. This is the
+# Repository pattern wired as a DI container entry: swap the repo (or
+# its backing Session) in a test by overriding the dependency, no monkey
+# patching required.
+def get_user_repo(db: Session = Depends(get_db)) -> UserRepository:
+    return UserRepository(db)
+
+
+def get_host_repo(db: Session = Depends(get_db)) -> HostRepository:
+    return HostRepository(db)
+
+
+def get_metric_repo(db: Session = Depends(get_db)) -> MetricRepository:
+    return MetricRepository(db)
+
+
+def get_metric_strategy() -> MetricEvaluationStrategy:
+    """Returns the active metric-evaluation strategy — picked by the
+    ``METRIC_STRATEGY`` env var (``default`` | ``strict``)."""
+    return get_strategy()
 
 
 # ─── Health check ──────────────────────────────────────────────────────
@@ -68,13 +102,9 @@ def health():
 # ═══════════════════════════════════════════════════════════════════════
 def verify_agent_token(
     x_api_token: str = Header(..., alias="X-API-Token"),
-    db: Session = Depends(get_db),
+    hosts: HostRepository = Depends(get_host_repo),
 ) -> models.Host:
-    host = (
-        db.query(models.Host)
-        .filter(models.Host.api_token == x_api_token)
-        .first()
-    )
+    host = hosts.get_by_api_token(x_api_token)
     if not host:
         raise HTTPException(status_code=401, detail="Invalid API token")
     return host
@@ -84,121 +114,78 @@ def verify_agent_token(
 def receive_telemetry(
     payload: schemas.HostMetricCreate,
     host: models.Host = Depends(verify_agent_token),
-    db: Session = Depends(get_db),
+    hosts: HostRepository = Depends(get_host_repo),
+    metrics: MetricRepository = Depends(get_metric_repo),
+    strategy: MetricEvaluationStrategy = Depends(get_metric_strategy),
 ):
-    # New metric row with the FULL set of host-level stats the agent now sends.
-    db_metric = models.HostMetric(
-        host_id=host.id,
+    # 1. Persist the metric snapshot + child container rows (repository
+    #    encapsulates both INSERTs and the inner commit).
+    db_metric = metrics.record_telemetry(host_id=host.id, payload=payload)
+
+    # 2. Update heartbeat metadata on the host (is_online / last_seen_at
+    #    / one-time OS fill).
+    hosts.touch_heartbeat(
+        host,
+        os_info=payload.os_info,
+        uptime_seconds=payload.uptime_seconds,
+    )
+
+    # 3. Evaluate with the active Strategy. A non-OK status is logged as
+    #    a warning so operators can grep for host health regressions.
+    evaluation = strategy.evaluate(
         cpu_percent=payload.cpu_percent,
         ram_percent=payload.ram_percent,
         disk_percent=payload.disk_percent,
-        inode_percent=payload.inode_percent,
-        disk_read_bytes_per_sec=payload.disk_read_bytes_per_sec,
-        disk_write_bytes_per_sec=payload.disk_write_bytes_per_sec,
-        net_external_rx_bps=payload.net_external_rx_bps,
-        net_external_tx_bps=payload.net_external_tx_bps,
-        net_internal_rx_bps=payload.net_internal_rx_bps,
-        net_internal_tx_bps=payload.net_internal_tx_bps,
     )
-    db.add(db_metric)
-    db.commit()
-    db.refresh(db_metric)
-
-    for container in payload.containers:
-        db.add(
-            models.ContainerMetric(
-                host_metric_id=db_metric.id,
-                container_id=container.container_id,
-                name=container.name,
-                state=container.state,
-                cpu_percent=container.cpu_percent,
-                ram_percent=container.ram_percent,
-            )
+    if evaluation.status.value != "ok":
+        log.warning(
+            "[telemetry] host=%s strategy=%s status=%s reasons=%s",
+            host.name,
+            strategy.name,
+            evaluation.status.value,
+            "; ".join(evaluation.reasons),
         )
 
-    host.is_online = True  # type: ignore[assignment]
-    host.last_seen_at = _now()
-    # One-time: fill OS / uptime on first heartbeat if not already set.
-    if payload.os_info and not host.os_info:
-        host.os_info = payload.os_info
-    if payload.uptime_seconds is not None:
-        host.uptime_seconds = payload.uptime_seconds
-    db.commit()
-    return {"status": "success", "metric_id": db_metric.id}
+    return {
+        "status": "success",
+        "metric_id": db_metric.id,
+        "evaluation": evaluation.as_dict(),
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════
 #  DASHBOARD (JWT-protected) + RBAC
 # ═══════════════════════════════════════════════════════════════════════
-# A host is considered offline if its last heartbeat is older than 60 s.
-HOST_OFFLINE_AFTER_SECONDS = 60
-
-
-def _mark_stale_offline(db: Session) -> None:
-    cutoff = _now() - timedelta(seconds=HOST_OFFLINE_AFTER_SECONDS)
-    (
-        db.query(models.Host)
-        .filter(models.Host.last_seen_at != None)  # noqa: E711
-        .filter(models.Host.last_seen_at < cutoff)
-        .filter(models.Host.is_online.is_(True))
-        .update({models.Host.is_online: False}, synchronize_session=False)
-    )
-    db.commit()
-
-
-# ─── RBAC helpers ──────────────────────────────────────────────────────
-def _visible_host_ids(db: Session, user: models.User) -> set[int]:
-    """Return the set of host IDs the user is allowed to see.
-
-    Rules:
-      - Super-admin (User.is_admin=True) sees EVERYTHING.
-      - A regular user sees (hosts they own) ∪ (hosts granted via HostAccess).
-    """
-    if user.is_admin:
-        return {h[0] for h in db.query(models.Host.id).all()}
-    owned = {h[0] for h in db.query(models.Host.id).filter(models.Host.owner_id == user.id).all()}
-    shared = {
-        h[0] for h in db.query(models.HostAccess.host_id)
-        .filter(models.HostAccess.user_id == user.id).all()
-    }
-    return owned | shared
-
-
-def _can_view_host(db: Session, user: models.User, host: models.Host) -> bool:
+# ─── RBAC helpers (thin — delegate reads to HostRepository) ────────────
+def _can_view_host(hosts: HostRepository, user: models.User, host: models.Host) -> bool:
     if user.is_admin:
         return True
     if host.owner_id == user.id:
         return True
-    return (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host.id)
-        .filter(models.HostAccess.user_id == user.id)
-        .first()
-        is not None
-    )
+    return hosts.has_access(host.id, user.id)
 
 
 def _can_manage_host(user: models.User, host: models.Host) -> bool:
     """Who can share/revoke access and delete the host: owner or super-admin."""
-    return user.is_admin or host.owner_id == user.id
+    return bool(user.is_admin or host.owner_id == user.id)
 
 
 def _require_host_view(
-    host_id: int, db: Session, user: models.User
+    host_id: int, hosts: HostRepository, user: models.User
 ) -> models.Host:
-    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    host = hosts.get_by_id(host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Хост не знайдено")
-    if not _can_view_host(db, user, host):
+    if not _can_view_host(hosts, user, host):
         # Reveal nothing — same 404 the UI would see for a non-existent host.
         raise HTTPException(status_code=404, detail="Хост не знайдено")
     return host
 
 
 def _require_host_manage(
-    host_id: int, db: Session, user: models.User
+    host_id: int, hosts: HostRepository, user: models.User
 ) -> models.Host:
-    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    host = hosts.get_by_id(host_id)
     if not host:
         raise HTTPException(status_code=404, detail="Хост не знайдено")
     if not _can_manage_host(user, host):
@@ -220,28 +207,28 @@ def _access_role_label(user: models.User, host: models.Host) -> str:
 # ─── Hosts list ─────────────────────────────────────────────────────────
 @app.get("/api/hosts", response_model=list[schemas.HostDetail], tags=["dashboard"])
 def get_hosts(
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
+    metrics: MetricRepository = Depends(get_metric_repo),
+    strategy: MetricEvaluationStrategy = Depends(get_metric_strategy),
 ):
-    _mark_stale_offline(db)
-    visible = _visible_host_ids(db, user)
+    hosts.mark_stale_offline(offline_after_seconds=HOST_OFFLINE_AFTER_SECONDS)
+    visible = hosts.visible_host_ids(user)
     if not visible:
         return []
-    hosts = (
-        db.query(models.Host)
-        .filter(models.Host.id.in_(visible))
-        .order_by(models.Host.id.asc())
-        .all()
-    )
+
+    rows = hosts.list_by_ids(visible)
     out = []
-    for h in hosts:
-        last = (
-            db.query(models.HostMetric)
-            .filter(models.HostMetric.host_id == h.id)
-            .order_by(models.HostMetric.timestamp.desc())
-            .first()
-        )
+    for h in rows:
+        last = metrics.latest_for_host(h.id)
         owner_name = h.owner.username if h.owner else None
+        # Evaluate current health against the active strategy so the UI
+        # can colour-code tiles consistently with the server's own view.
+        evaluation = strategy.evaluate(
+            cpu_percent=last.cpu_percent if last else None,
+            ram_percent=last.ram_percent if last else None,
+            disk_percent=last.disk_percent if last else None,
+        )
         out.append({
             "id": h.id,
             "name": h.name,
@@ -259,6 +246,10 @@ def get_hosts(
             "owner_id": h.owner_id,
             "owner_username": owner_name,
             "my_access": _access_role_label(user, h),
+            # Strategy-driven health status (non-breaking additive field;
+            # HostDetail ignores unknown keys because Pydantic's default
+            # is to drop them). Kept here so UIs that opt-in can read it.
+            "health_status": evaluation.status.value,
         })
     return out
 
@@ -267,41 +258,28 @@ def get_hosts(
 def get_host_metrics(
     host_id: int,
     limit: int = 60,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
+    metrics: MetricRepository = Depends(get_metric_repo),
 ):
-    _require_host_view(host_id, db, user)
-    rows = (
-        db.query(models.HostMetric)
-        .filter(models.HostMetric.host_id == host_id)
-        .order_by(models.HostMetric.timestamp.desc())
-        .limit(min(limit, 240))
-        .all()
-    )
+    _require_host_view(host_id, hosts, user)
+    rows = metrics.latest_n_for_host(host_id, limit=limit)
+    # Historically returned oldest-first for chart rendering.
     return list(reversed(rows))
 
 
 @app.get("/api/hosts/{host_id}/containers", tags=["dashboard"])
 def get_latest_containers(
     host_id: int,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
+    metrics: MetricRepository = Depends(get_metric_repo),
 ):
-    _require_host_view(host_id, db, user)
-    newest = (
-        db.query(models.HostMetric)
-        .filter(models.HostMetric.host_id == host_id)
-        .order_by(models.HostMetric.timestamp.desc())
-        .first()
-    )
+    _require_host_view(host_id, hosts, user)
+    newest = metrics.latest_for_host(host_id)
     if not newest:
         return []
-    rows = (
-        db.query(models.ContainerMetric)
-        .filter(models.ContainerMetric.host_metric_id == newest.id)
-        .order_by(models.ContainerMetric.name.asc())
-        .all()
-    )
+    rows = metrics.container_metrics_for(newest.id)
     return [
         {
             "container_id": r.container_id,
@@ -345,12 +323,12 @@ def _render_compose(host: models.Host, hub_url: str) -> str:
 def register_host(
     body: schemas.HostCreateRequest,
     request: Request,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
     # ANY logged-in user may create a host. The creator becomes its owner
-    # ("admin of that server") — per the new RBAC spec.
-    if db.query(models.Host).filter(models.Host.name == body.name).first():
+    # ("admin of that server") — per the RBAC spec.
+    if hosts.get_by_name(body.name):
         raise HTTPException(status_code=400, detail="Хост з такою назвою вже існує")
 
     token = secrets.token_urlsafe(32)
@@ -364,9 +342,7 @@ def register_host(
         is_online=False,
         owner_id=user.id,
     )
-    db.add(host)
-    db.commit()
-    db.refresh(host)
+    hosts.add(host)
 
     hub_url = os.getenv("PUBLIC_HUB_URL") or str(request.base_url).rstrip("/")
 
@@ -385,33 +361,15 @@ def register_host(
 @app.delete("/api/hosts/{host_id}", tags=["dashboard"])
 def delete_host(
     host_id: int,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
-    host = _require_host_manage(host_id, db, user)
-    db.delete(host)
-    db.commit()
+    host = _require_host_manage(host_id, hosts, user)
+    hosts.delete(host)
     return {"message": "deleted"}
 
 
 # ─── Host access sharing (RBAC) ────────────────────────────────────────
-def _resolve_user_by_identifier(db: Session, identifier: str) -> models.User | None:
-    """Accept either email or username. Case-insensitive on email."""
-    ident = identifier.strip()
-    if not ident:
-        return None
-    # Try username first (usernames are case-sensitive per our model)
-    u = db.query(models.User).filter(models.User.username == ident).first()
-    if u:
-        return u
-    # Then try email (lowercased)
-    return (
-        db.query(models.User)
-        .filter(models.User.email.ilike(ident))
-        .first()
-    )
-
-
 @app.get(
     "/api/hosts/{host_id}/access",
     response_model=schemas.HostAccessBoard,
@@ -419,17 +377,13 @@ def _resolve_user_by_identifier(db: Session, identifier: str) -> models.User | N
 )
 def host_access_board(
     host_id: int,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
     """Who can see this host. Readable by anyone with view access;
     only owner / super-admin get `can_manage=True`."""
-    host = _require_host_view(host_id, db, user)
-    grants = (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host_id)
-        .all()
-    )
+    host = _require_host_view(host_id, hosts, user)
+    grants = hosts.list_access_grants(host_id)
     entries = []
     for g in grants:
         entries.append(schemas.HostAccessEntry(
@@ -457,11 +411,12 @@ def host_access_board(
 def share_host_access(
     host_id: int,
     body: schemas.ShareHostRequest,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    host = _require_host_manage(host_id, db, user)
-    target = _resolve_user_by_identifier(db, body.identifier)
+    host = _require_host_manage(host_id, hosts, user)
+    target = users.find_by_email_or_username(body.identifier)
     if not target:
         # EXACT message the spec asks for: existing-user check.
         raise HTTPException(
@@ -478,24 +433,12 @@ def share_host_access(
             status_code=400,
             detail="Супер-адмін уже має доступ до всіх хостів",
         )
-
-    existing = (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host.id)
-        .filter(models.HostAccess.user_id == target.id)
-        .first()
-    )
-    if existing:
+    if hosts.get_access_grant(host.id, target.id):
         raise HTTPException(status_code=400, detail="Доступ уже надано")
 
-    grant = models.HostAccess(
-        host_id=host.id,
-        user_id=target.id,
-        granted_by_id=user.id,
+    grant = hosts.add_access_grant(
+        host_id=host.id, user_id=target.id, granted_by_id=user.id
     )
-    db.add(grant)
-    db.commit()
-    db.refresh(grant)
 
     return schemas.HostAccessEntry(
         user_id=target.id,
@@ -514,20 +457,14 @@ def share_host_access(
 def revoke_host_access(
     host_id: int,
     user_id: int,
-    db: Session = Depends(get_db),
     user: models.User = Depends(auth.get_current_user),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
-    _require_host_manage(host_id, db, user)
-    grant = (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host_id)
-        .filter(models.HostAccess.user_id == user_id)
-        .first()
-    )
+    _require_host_manage(host_id, hosts, user)
+    grant = hosts.get_access_grant(host_id, user_id)
     if not grant:
         raise HTTPException(status_code=404, detail="Запис доступу не знайдено")
-    db.delete(grant)
-    db.commit()
+    hosts.delete_access_grant(grant)
     return {"message": "revoked"}
 
 
@@ -538,27 +475,20 @@ def revoke_host_access(
     tags=["admin"],
 )
 def admin_access_matrix(
-    db: Session = Depends(get_db),
     _admin: models.User = Depends(auth.get_current_admin),
+    users: UserRepository = Depends(get_user_repo),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
-    users = db.query(models.User).order_by(models.User.id.asc()).all()
+    all_users = users.list_all()
     rows = []
-    for u in users:
-        owned = [
-            h[0] for h in db.query(models.Host.id)
-            .filter(models.Host.owner_id == u.id).all()
-        ]
-        shared = [
-            h[0] for h in db.query(models.HostAccess.host_id)
-            .filter(models.HostAccess.user_id == u.id).all()
-        ]
+    for u in all_users:
         rows.append(schemas.AdminUserAccessRow(
             user_id=u.id,
             username=u.username,
             email=u.email,
             is_admin=u.is_admin,
-            owned_host_ids=owned,
-            shared_host_ids=shared,
+            owned_host_ids=hosts.owned_ids(u.id),
+            shared_host_ids=hosts.shared_host_ids(u.id),
         ))
     return rows
 
@@ -570,25 +500,19 @@ def admin_access_matrix(
 def admin_grant_access(
     user_id: int,
     host_id: int,
-    db: Session = Depends(get_db),
     admin: models.User = Depends(auth.get_current_admin),
+    users: UserRepository = Depends(get_user_repo),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
-    target = db.query(models.User).filter(models.User.id == user_id).first()
-    host = db.query(models.Host).filter(models.Host.id == host_id).first()
+    target = users.get_by_id(user_id)
+    host = hosts.get_by_id(host_id)
     if not target or not host:
         raise HTTPException(status_code=404, detail="User or host not found")
     if host.owner_id == user_id or target.is_admin:
         return {"message": "already-has-access"}
-    exists = (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host_id)
-        .filter(models.HostAccess.user_id == user_id)
-        .first()
-    )
-    if exists:
+    if hosts.get_access_grant(host_id, user_id):
         return {"message": "already-granted"}
-    db.add(models.HostAccess(host_id=host_id, user_id=user_id, granted_by_id=admin.id))
-    db.commit()
+    hosts.add_access_grant(host_id=host_id, user_id=user_id, granted_by_id=admin.id)
     return {"message": "granted"}
 
 
@@ -599,19 +523,13 @@ def admin_grant_access(
 def admin_revoke_access(
     user_id: int,
     host_id: int,
-    db: Session = Depends(get_db),
     _admin: models.User = Depends(auth.get_current_admin),
+    hosts: HostRepository = Depends(get_host_repo),
 ):
-    grant = (
-        db.query(models.HostAccess)
-        .filter(models.HostAccess.host_id == host_id)
-        .filter(models.HostAccess.user_id == user_id)
-        .first()
-    )
+    grant = hosts.get_access_grant(host_id, user_id)
     if not grant:
         raise HTTPException(status_code=404, detail="Grant not found")
-    db.delete(grant)
-    db.commit()
+    hosts.delete_access_grant(grant)
     return {"message": "revoked"}
 
 
@@ -672,6 +590,7 @@ async def register_user(
     user: schemas.UserCreate,
     request: Request,
     db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
     ip = request.client.host if request.client else "unknown"
 
@@ -681,11 +600,11 @@ async def register_user(
             status_code=400, detail="CAPTCHA перевірка не пройдена"
         )
 
-    if db.query(models.User).filter(models.User.email == user.email).first():
+    if users.get_by_email(user.email):
         raise HTTPException(
             status_code=400, detail="Електронна пошта вже зареєстрована"
         )
-    if db.query(models.User).filter(models.User.username == user.username).first():
+    if users.get_by_username(user.username):
         raise HTTPException(
             status_code=400, detail="Ім'я користувача вже зайняте"
         )
@@ -697,10 +616,8 @@ async def register_user(
         # Task 3 — account starts INACTIVE; activation link flips the flag.
         is_active=False,
     )
-    db.add(db_user)
     try:
-        db.commit()
-        db.refresh(db_user)
+        users.add(db_user)
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Користувач вже існує")
@@ -759,9 +676,11 @@ def activate_account(token: str, db: Session = Depends(get_db)):
 
 @app.post("/api/activation/resend", tags=["auth"])
 def resend_activation(
-    body: schemas.ResendActivationRequest, db: Session = Depends(get_db)
+    body: schemas.ResendActivationRequest,
+    db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    user = db.query(models.User).filter(models.User.email == body.email).first()
+    user = users.get_by_email(body.email)
     # Reply identically whether or not the email exists (anti-enumeration).
     if user and not user.is_active:
         token = _issue_activation_token(db, user)
@@ -802,35 +721,15 @@ def _is_temporarily_locked(user: models.User) -> bool:
     return bool(user.locked_until and user.locked_until > _now())
 
 
-def _bump_failed_attempt(db: Session, user: models.User) -> None:
-    user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
-    if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
-        user.locked_until = _now() + timedelta(minutes=LOCKOUT_MINUTES)
-        log.warning(
-            "Account %s temporarily locked after %s failed attempts",
-            user.username, user.failed_login_attempts,
-        )
-    db.commit()
-
-
-def _reset_failed_attempts(db: Session, user: models.User) -> None:
-    user.failed_login_attempts = 0
-    user.locked_until = None
-    db.commit()
-
-
 @app.post("/api/login", response_model=schemas.LoginResponse, tags=["auth"])
 def login_for_access_token(
     request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
     ip = request.client.host if request.client else "unknown"
-    user = (
-        db.query(models.User)
-        .filter(models.User.username == form_data.username)
-        .first()
-    )
+    user = users.get_by_username(form_data.username)
 
     # 1. Hard lock (admin-set) — check BEFORE touching the password. We also
     #    don't want "wrong password" responses to leak that the account exists
@@ -873,7 +772,14 @@ def login_for_access_token(
     #    If a user existed, bump its failed-attempt counter.
     if not user or not auth.verify_password(form_data.password, user.password_hash):
         if user:
-            _bump_failed_attempt(db, user)
+            users.bump_failed_attempt(
+                user, max_attempts=MAX_FAILED_ATTEMPTS, lock_minutes=LOCKOUT_MINUTES
+            )
+            if user.failed_login_attempts >= MAX_FAILED_ATTEMPTS:
+                log.warning(
+                    "Account %s temporarily locked after %s failed attempts",
+                    user.username, user.failed_login_attempts,
+                )
         _log_login(
             db,
             user_id=user.id if user else None,
@@ -903,7 +809,7 @@ def login_for_access_token(
         )
 
     # 5. Credentials OK — reset the counter.
-    _reset_failed_attempts(db, user)
+    users.reset_failed_attempts(user)
 
     # 6. If 2FA is enabled, DON'T issue the JWT yet. Return a short-lived
     #    ticket and require POST /api/2fa/verify-login.
@@ -940,14 +846,17 @@ def verify_login_2fa(
     body: schemas.TwoFALoginVerify,
     request: Request,
     db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
     user_id = _consume_twofa_ticket(body.ticket)
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = users.get_by_id(user_id)
     ip = request.client.host if request.client else "unknown"
     if not user or not user.is_2fa_enabled or not user.totp_secret:
         raise HTTPException(status_code=400, detail="2FA не ввімкнено для цього акаунта")
     if not totp.verify(user.totp_secret, body.code):
-        _bump_failed_attempt(db, user)
+        users.bump_failed_attempt(
+            user, max_attempts=MAX_FAILED_ATTEMPTS, lock_minutes=LOCKOUT_MINUTES
+        )
         _log_login(
             db,
             user_id=user.id,
@@ -958,7 +867,7 @@ def verify_login_2fa(
         )
         raise HTTPException(status_code=401, detail="Невірний код 2FA")
 
-    _reset_failed_attempts(db, user)
+    users.reset_failed_attempts(user)
     access_token = auth.create_access_token(
         data={"sub": user.username, "role": user.role.value}
     )
@@ -1059,9 +968,11 @@ def twofa_disable(
 # ═══════════════════════════════════════════════════════════════════════
 @app.post("/api/password/forgot", tags=["auth"])
 def password_forgot(
-    body: schemas.PasswordForgotRequest, db: Session = Depends(get_db)
+    body: schemas.PasswordForgotRequest,
+    db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    user = db.query(models.User).filter(models.User.email == body.email).first()
+    user = users.get_by_email(body.email)
     # Always answer identically — anti-enumeration.
     if user:
         token = secrets.token_urlsafe(32)
@@ -1134,41 +1045,41 @@ def admin_login_logs(
     tags=["admin"],
 )
 def admin_users(
-    db: Session = Depends(get_db),
     _admin: models.User = Depends(auth.get_current_admin),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    return db.query(models.User).order_by(models.User.id.asc()).all()
+    return users.list_all()
 
 
 @app.post("/api/admin/users/{user_id}/lock", tags=["admin"])
 def admin_lock_user(
     user_id: int,
-    db: Session = Depends(get_db),
     admin: models.User = Depends(auth.get_current_admin),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = users.get_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Користувача не знайдено")
     if user.id == admin.id:
         raise HTTPException(status_code=400, detail="Не можна заблокувати власний акаунт")
     user.is_locked = True
-    db.commit()
+    users.save()
     return {"message": f"Користувача {user.username} заблоковано"}
 
 
 @app.post("/api/admin/users/{user_id}/unlock", tags=["admin"])
 def admin_unlock_user(
     user_id: int,
-    db: Session = Depends(get_db),
     _admin: models.User = Depends(auth.get_current_admin),
+    users: UserRepository = Depends(get_user_repo),
 ):
-    user = db.query(models.User).filter(models.User.id == user_id).first()
+    user = users.get_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Користувача не знайдено")
     user.is_locked = False
     user.failed_login_attempts = 0
     user.locked_until = None
-    db.commit()
+    users.save()
     return {"message": f"Користувача {user.username} розблоковано"}
 
 
@@ -1181,7 +1092,10 @@ class GoogleAuthRequest(BaseModel):
 
 @app.post("/api/auth/google", tags=["auth"])
 async def google_auth(
-    body: GoogleAuthRequest, request: Request, db: Session = Depends(get_db)
+    body: GoogleAuthRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    users: UserRepository = Depends(get_user_repo),
 ):
     async with httpx.AsyncClient(timeout=5.0) as client:
         response = await client.get(
@@ -1202,7 +1116,7 @@ async def google_auth(
     if expected_aud and info.get("aud") != expected_aud:
         raise HTTPException(status_code=400, detail="Невідповідність Google Client ID")
 
-    user = db.query(models.User).filter(models.User.email == email).first()
+    user = users.get_by_email(email)
     if not user:
         random_password = str(uuid.uuid4()) + "A1!"
         user = models.User(
@@ -1211,10 +1125,8 @@ async def google_auth(
             password_hash=auth.get_password_hash(random_password),
             is_active=True,  # Google already verified the email
         )
-        db.add(user)
         try:
-            db.commit()
-            db.refresh(user)
+            users.add(user)
         except IntegrityError:
             db.rollback()
             user = models.User(
@@ -1223,9 +1135,7 @@ async def google_auth(
                 password_hash=auth.get_password_hash(random_password),
                 is_active=True,
             )
-            db.add(user)
-            db.commit()
-            db.refresh(user)
+            users.add(user)
 
     if user.is_locked:
         raise HTTPException(status_code=403, detail="Акаунт заблоковано адміністратором")

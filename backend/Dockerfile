@@ -7,4 +7,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# entrypoint.sh runs `alembic upgrade head` before launching uvicorn,
+# so schema drift (e.g. missing hosts.owner_id) can never recur on
+# container start. `chmod +x` is explicit because Windows bind-mounts
+# don't preserve POSIX execute bits.
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]
